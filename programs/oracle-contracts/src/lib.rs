@@ -7,23 +7,30 @@ declare_id!("CyJDfKuJ7aAF86dJifrKXBWLLrT2TcmoqSVvqgTJ9FR6");
 pub mod binary_oracle {
     use super::*;
 
+    //initializoor
     pub fn initialize(ctx: Context<Initialize>, collateral: u64) -> Result<()> {
         let oracle = &mut ctx.accounts.oracle;
         oracle.authority = ctx.accounts.authority.key();
         oracle.collateral = collateral;
         oracle.is_resolved = false;
         oracle.resolution_bit = false;
-        oracle.phase = Phase::Inactive;
+        oracle.phase = Phase::Precommit;
         oracle.reveal_end_time = 0;
         oracle.total_nodes = 0;
         oracle.committed_nodes = 0;
         Ok(())
     }
 
+    //allows nodes to join this network
     pub fn join_network(ctx: Context<JoinNetwork>) -> Result<()> {
         let oracle = &mut ctx.accounts.oracle;
         let node = &mut ctx.accounts.node;
         let node_authority = &ctx.accounts.node_authority;
+
+        require!(
+            oracle.phase == Phase::Precommit || oracle.phase == Phase::Commit,
+            ErrorCode::InvalidPhaseForJoining
+        );
 
         // Transfer collateral from node authority to oracle account
         let collateral = oracle.collateral;
@@ -33,23 +40,25 @@ pub mod binary_oracle {
         node.authority = node_authority.key();
         node.joined = true;
         node.slashed = false;
+        node.committed = false;
 
         oracle.total_nodes += 1;
 
         Ok(())
     }
 
-    pub fn start_request(ctx: Context<StartRequest>, reveal_duration: i64) -> Result<()> {
+    //starts oracle request
+    pub fn start_request(ctx: Context<StartRequest>) -> Result<()> {
         let oracle = &mut ctx.accounts.oracle;
-        require!(oracle.phase == Phase::Inactive, ErrorCode::InvalidPhase);
+        require!(oracle.phase == Phase::Precommit, ErrorCode::InvalidPhase);
 
         oracle.phase = Phase::Commit;
         oracle.committed_nodes = 0;
-        oracle.reveal_duration = reveal_duration;
 
         Ok(())
     }
 
+    //commit vote hash for nodes that have joined
     pub fn commit(ctx: Context<Commit>, vote_hash: [u8; 32]) -> Result<()> {
         let oracle = &mut ctx.accounts.oracle;
         let node = &mut ctx.accounts.node;
@@ -74,6 +83,7 @@ pub mod binary_oracle {
         Ok(())
     }
 
+    //reveal vote for nodes that have committed
     pub fn reveal(ctx: Context<Reveal>, vote: bool, nonce: [u8; 32]) -> Result<()> {
         let oracle = &mut ctx.accounts.oracle;
         let node = &mut ctx.accounts.node;
@@ -93,9 +103,10 @@ pub mod binary_oracle {
     pub fn slash_colluding(ctx: Context<SlashColluding>, vote: bool, nonce: [u8; 32]) -> Result<()> {
         let oracle = &ctx.accounts.oracle;
         let colluding_node = &mut ctx.accounts.colluding_node;
-        let slasher_node = &mut ctx.accounts.slasher_node;
+        let slasher_node = &ctx.accounts.slasher_node;
 
         require!(oracle.phase == Phase::Commit, ErrorCode::InvalidPhase);
+        require!(!slasher_node.committed, ErrorCode::SlasherAlreadyCommitted);
 
         let calculated_hash = hash(&[&[vote as u8], &nonce[..]].concat()).to_bytes();
         require!(calculated_hash == colluding_node.vote_hash, ErrorCode::InvalidCollusion);
@@ -107,7 +118,6 @@ pub mod binary_oracle {
 
         colluding_node.slashed = true;
         
-        // Update total_nodes in a separate instruction
         emit!(NodeSlashed { 
             oracle: oracle.key(), 
             slashed_node: colluding_node.key() 
@@ -116,6 +126,7 @@ pub mod binary_oracle {
         Ok(())
     }
 
+    //resolves oracle request
     pub fn resolve<'info>(
         ctx: Context<'_, '_, 'info, 'info, Resolve<'info>>
     ) -> Result<()> {
@@ -173,18 +184,18 @@ pub mod binary_oracle {
             }
         }
 
-        oracle.phase = Phase::Inactive;
+        oracle.phase = Phase::Complete;
 
         Ok(())
     }
-
 }
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, PartialEq, Eq)]
 pub enum Phase {
-    Inactive,
+    Precommit,
     Commit,
     Reveal,
+    Complete,
 }
 
 #[account]
@@ -296,4 +307,8 @@ pub enum ErrorCode {
     NodeNotJoined,
     #[msg("Node has already committed")]
     AlreadyCommitted,
+    #[msg("Invalid phase for joining the network")]
+    InvalidPhaseForJoining,
+    #[msg("Slasher has already committed")]
+    SlasherAlreadyCommitted,
 }
