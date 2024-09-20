@@ -1,5 +1,5 @@
 use anchor_lang::prelude::*;
-use anchor_lang::solana_program::hash::{hash, Hash};
+use anchor_lang::solana_program::hash::hash;
 
 declare_id!("CyJDfKuJ7aAF86dJifrKXBWLLrT2TcmoqSVvqgTJ9FR6");
 
@@ -7,8 +7,12 @@ declare_id!("CyJDfKuJ7aAF86dJifrKXBWLLrT2TcmoqSVvqgTJ9FR6");
 pub mod binary_oracle {
     use super::*;
 
-    //initializoor
-    pub fn initialize(ctx: Context<Initialize>, collateral: u64) -> Result<()> {
+    pub fn initialize(
+        ctx: Context<Initialize>, 
+        collateral: u64, 
+        reveal_duration: i64, 
+        max_nodes: u64
+    ) -> Result<()> {
         let oracle = &mut ctx.accounts.oracle;
         oracle.authority = ctx.accounts.authority.key();
         oracle.collateral = collateral;
@@ -16,12 +20,14 @@ pub mod binary_oracle {
         oracle.resolution_bit = false;
         oracle.phase = Phase::Precommit;
         oracle.reveal_end_time = 0;
+        oracle.reveal_duration = reveal_duration;
+        oracle.max_nodes = max_nodes;
         oracle.total_nodes = 0;
         oracle.committed_nodes = 0;
         Ok(())
     }
 
-    //allows nodes to join this network
+    //join network during precommit or commit phase, post collateral
     pub fn join_network(ctx: Context<JoinNetwork>) -> Result<()> {
         let oracle = &mut ctx.accounts.oracle;
         let node = &mut ctx.accounts.node;
@@ -31,6 +37,10 @@ pub mod binary_oracle {
             oracle.phase == Phase::Precommit || oracle.phase == Phase::Commit,
             ErrorCode::InvalidPhaseForJoining
         );
+        require!(
+            oracle.total_nodes < oracle.max_nodes,
+            ErrorCode::MaxNodesReached
+        );
 
         // Transfer collateral from node authority to oracle account
         let collateral = oracle.collateral;
@@ -38,19 +48,23 @@ pub mod binary_oracle {
         **oracle.to_account_info().try_borrow_mut_lamports()? += collateral;
 
         node.authority = node_authority.key();
-        node.joined = true;
+        node.vote_hash = None;
+        node.vote = None;
         node.slashed = false;
-        node.committed = false;
 
         oracle.total_nodes += 1;
 
         Ok(())
     }
 
-    //starts oracle request
+    //start the request (must be oracle authority)
     pub fn start_request(ctx: Context<StartRequest>) -> Result<()> {
         let oracle = &mut ctx.accounts.oracle;
         require!(oracle.phase == Phase::Precommit, ErrorCode::InvalidPhase);
+        require!(
+            ctx.accounts.authority.key() == oracle.authority,
+            ErrorCode::UnauthorizedAccess
+        );
 
         oracle.phase = Phase::Commit;
         oracle.committed_nodes = 0;
@@ -58,19 +72,15 @@ pub mod binary_oracle {
         Ok(())
     }
 
-    //commit vote hash for nodes that have joined
+    //commit vote during commit phase
     pub fn commit(ctx: Context<Commit>, vote_hash: [u8; 32]) -> Result<()> {
         let oracle = &mut ctx.accounts.oracle;
         let node = &mut ctx.accounts.node;
 
         require!(oracle.phase == Phase::Commit, ErrorCode::InvalidPhase);
-        require!(node.joined, ErrorCode::NodeNotJoined);
-        require!(!node.committed, ErrorCode::AlreadyCommitted);
+        require!(node.vote_hash.is_none(), ErrorCode::AlreadyCommitted);
 
-        node.vote_hash = vote_hash;
-        node.committed = true;
-        node.revealed = false;
-
+        node.vote_hash = Some(vote_hash);
         oracle.committed_nodes += 1;
 
         // If all nodes have committed, start the reveal phase
@@ -83,38 +93,39 @@ pub mod binary_oracle {
         Ok(())
     }
 
-    //reveal vote for nodes that have committed
+    //reveal vote during reveal phase
     pub fn reveal(ctx: Context<Reveal>, vote: bool, nonce: [u8; 32]) -> Result<()> {
         let oracle = &mut ctx.accounts.oracle;
         let node = &mut ctx.accounts.node;
 
         require!(oracle.phase == Phase::Reveal, ErrorCode::InvalidPhase);
         require!(Clock::get()?.unix_timestamp <= oracle.reveal_end_time, ErrorCode::RevealPhaseClosed);
+        require!(node.vote_hash.is_some(), ErrorCode::NotCommitted);
+        require!(node.vote.is_none(), ErrorCode::AlreadyRevealed);
 
         let calculated_hash = hash(&[&[vote as u8], &nonce[..]].concat()).to_bytes();
-        require!(calculated_hash == node.vote_hash, ErrorCode::InvalidReveal);
+        require!(calculated_hash == node.vote_hash.unwrap(), ErrorCode::InvalidReveal);
 
-        node.vote = vote;
-        node.revealed = true;
+        node.vote = Some(vote);
 
         Ok(())
     }
 
+    //slash colluding node with proof of collusion
     pub fn slash_colluding(ctx: Context<SlashColluding>, vote: bool, nonce: [u8; 32]) -> Result<()> {
-        let oracle = &ctx.accounts.oracle;
+        let oracle = &mut ctx.accounts.oracle;
         let colluding_node = &mut ctx.accounts.colluding_node;
-        let slasher_node = &ctx.accounts.slasher_node;
 
         require!(oracle.phase == Phase::Commit, ErrorCode::InvalidPhase);
-        require!(!slasher_node.committed, ErrorCode::SlasherAlreadyCommitted);
+        require!(colluding_node.vote_hash.is_some(), ErrorCode::NotCommitted);
 
         let calculated_hash = hash(&[&[vote as u8], &nonce[..]].concat()).to_bytes();
-        require!(calculated_hash == colluding_node.vote_hash, ErrorCode::InvalidCollusion);
+        require!(calculated_hash == colluding_node.vote_hash.unwrap(), ErrorCode::InvalidCollusion);
 
-        // Transfer collateral from colluding node to slasher
+        // Transfer collateral from colluding node to oracle pool
         let collateral = oracle.collateral;
         **colluding_node.to_account_info().try_borrow_mut_lamports()? -= collateral;
-        **slasher_node.to_account_info().try_borrow_mut_lamports()? += collateral;
+        **oracle.to_account_info().try_borrow_mut_lamports()? += collateral;
 
         colluding_node.slashed = true;
         
@@ -126,7 +137,7 @@ pub mod binary_oracle {
         Ok(())
     }
 
-    //resolves oracle request
+    //resolves the request, distributes slashed collateral to consensus nodes
     pub fn resolve<'info>(
         ctx: Context<'_, '_, 'info, 'info, Resolve<'info>>
     ) -> Result<()> {
@@ -137,49 +148,36 @@ pub mod binary_oracle {
         let mut true_votes = 0;
         let mut false_votes = 0;
         let mut total_nodes = 0;
-        let mut consensus_nodes = 0;
 
-        let nodes: Vec<(&'info AccountInfo<'info>, Account<'info, Node>)> = ctx.remaining_accounts
-            .iter()
-            .filter_map(|account_info| {
-                match Account::<Node>::try_from(account_info) {
-                    Ok(node) => Some((account_info, node)),
-                    Err(_) => None,
-                }
-            })
-            .collect();
-
-        for (account_info, node) in nodes.iter() {
-            if !node.slashed && node.joined {
+        for node_info in ctx.remaining_accounts.iter() {
+            let node = Account::<Node>::try_from(node_info)?;
+            if !node.slashed {
                 total_nodes += 1;
-                if node.revealed {
-                    if node.vote {
+                if let Some(vote) = node.vote {
+                    if vote {
                         true_votes += 1;
                     } else {
                         false_votes += 1;
                     }
-                } else {
-                    // Slash unrevealed nodes
-                    **account_info.try_borrow_mut_lamports()? -= oracle.collateral;
-                    **oracle.to_account_info().try_borrow_mut_lamports()? += oracle.collateral;
                 }
             }
         }
 
         oracle.is_resolved = true;
         oracle.resolution_bit = true_votes > false_votes;
-        consensus_nodes = if oracle.resolution_bit { true_votes } else { false_votes };
+        let consensus_nodes = if oracle.resolution_bit { true_votes } else { false_votes };
 
-        // Distribute slashed collateral to consensus nodes
+        // Distribute rewards to consensus nodes
         let reward_per_node = if consensus_nodes > 0 {
-            (total_nodes - consensus_nodes) * oracle.collateral / consensus_nodes
+            oracle.collateral * total_nodes / consensus_nodes
         } else {
             0
         };
 
-        for (account_info, node) in nodes.iter() {
-            if !node.slashed && node.joined && node.revealed && node.vote == oracle.resolution_bit {
-                **account_info.try_borrow_mut_lamports()? += reward_per_node;
+        for node_info in ctx.remaining_accounts.iter() {
+            let node = Account::<Node>::try_from(node_info)?;
+            if !node.slashed && node.vote == Some(oracle.resolution_bit) {
+                **node_info.try_borrow_mut_lamports()? += reward_per_node;
                 **oracle.to_account_info().try_borrow_mut_lamports()? -= reward_per_node;
             }
         }
@@ -207,6 +205,7 @@ pub struct Oracle {
     pub phase: Phase,
     pub reveal_end_time: i64,
     pub reveal_duration: i64,
+    pub max_nodes: u64,
     pub total_nodes: u64,
     pub committed_nodes: u64,
 }
@@ -214,17 +213,14 @@ pub struct Oracle {
 #[account]
 pub struct Node {
     pub authority: Pubkey,
-    pub joined: bool,
-    pub vote_hash: [u8; 32],
-    pub vote: bool,
-    pub committed: bool,
-    pub revealed: bool,
+    pub vote_hash: Option<[u8; 32]>,
+    pub vote: Option<bool>,
     pub slashed: bool,
 }
 
 #[derive(Accounts)]
 pub struct Initialize<'info> {
-    #[account(init, payer = authority, space = 8 + 32 + 8 + 1 + 1 + 1 + 8 + 8 + 8 + 8)]
+    #[account(init, payer = authority, space = 8 + 32 + 8 + 1 + 1 + 1 + 8 + 8 + 8 + 8 + 8)]
     pub oracle: Account<'info, Oracle>,
     #[account(mut)]
     pub authority: Signer<'info>,
@@ -235,7 +231,7 @@ pub struct Initialize<'info> {
 pub struct JoinNetwork<'info> {
     #[account(mut)]
     pub oracle: Account<'info, Oracle>,
-    #[account(init, payer = node_authority, space = 8 + 32 + 1 + 32 + 1 + 1 + 1 + 1)]
+    #[account(init, payer = node_authority, space = 8 + 32 + 33 + 2 + 1)]
     pub node: Account<'info, Node>,
     #[account(mut)]
     pub node_authority: Signer<'info>,
@@ -273,8 +269,6 @@ pub struct SlashColluding<'info> {
     pub oracle: Account<'info, Oracle>,
     #[account(mut)]
     pub colluding_node: Account<'info, Node>,
-    #[account(mut)]
-    pub slasher_node: Account<'info, Node>,
     pub slasher: Signer<'info>,
 }
 
@@ -303,12 +297,16 @@ pub enum ErrorCode {
     InvalidCollusion,
     #[msg("Reveal phase is not closed yet")]
     RevealPhaseNotClosed,
-    #[msg("Node has not joined the network")]
-    NodeNotJoined,
+    #[msg("Node has not committed")]
+    NotCommitted,
     #[msg("Node has already committed")]
     AlreadyCommitted,
+    #[msg("Node has already revealed")]
+    AlreadyRevealed,
     #[msg("Invalid phase for joining the network")]
     InvalidPhaseForJoining,
-    #[msg("Slasher has already committed")]
-    SlasherAlreadyCommitted,
+    #[msg("Maximum number of nodes reached")]
+    MaxNodesReached,
+    #[msg("Unauthorized access")]
+    UnauthorizedAccess,
 }
